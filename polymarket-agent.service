@@ -1,0 +1,18 @@
+[Unit]
+Description=Polymarket Trading Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/polymarket-agent
+ExecStart=/home/ubuntu/polymarket-agent/venv/bin/python main.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polymarket-agent
+
+[Install]
+WantedBy=multi-user.target

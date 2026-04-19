@@ -1,0 +1,13 @@
+aiosqlite==0.22.1
+anthropic==0.96.0
+APScheduler==3.11.2
+eth-account==0.13.7
+poly_eip712_structs==0.0.1
+py_builder_signing_sdk==0.0.2
+py_clob_client==0.34.6
+py_order_utils==0.3.2
+pycryptodome==3.23.0
+python-dotenv==1.2.2
+python-telegram-bot==22.7
+requests==2.33.1
+structlog==25.5.0
