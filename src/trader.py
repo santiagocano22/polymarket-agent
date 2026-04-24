@@ -77,7 +77,7 @@ class Trader:
         if not strategy.strip():
             return
 
-        markets, positions, balance = await asyncio.gather(
+        markets, positions, balance, trades_today, last_ts = await asyncio.gather(
             self.poly.search_markets(
                 limit=60,
                 min_volume_24h=self.cfg.market_min_volume_24h,
@@ -86,6 +86,8 @@ class Trader:
             ),
             self.poly.get_positions(),
             self.poly.get_usdc_balance(),
+            self.db.count_trades_today(),
+            self.db.last_trade_ts(),
         )
         markets = markets[: self.cfg.max_markets_per_cycle]
 
@@ -124,12 +126,17 @@ class Trader:
 
         log.info(
             "cycle: balance=%.2f pos_value=%.2f total=%.2f "
-            "max_exposure=%.2f max_per_trade=%.2f open=%d/%s markets=%d",
+            "max_exposure=%.2f max_per_trade=%.2f open=%d/%s trades_today=%d markets=%d",
             balance, positions_value, total_value, max_exposure_usd,
             dynamic_max_per_trade, len(positions),
             str(max_open_positions) if max_open_positions else "∞",
-            len(markets),
+            trades_today, len(markets),
         )
+
+        # ── Circuit breaker duro: máximo 4 trades ejecutados por día UTC ────────
+        if trades_today >= 4:
+            log.info("cycle: circuit breaker — trades_today=%d >= 4, skipping LLM", trades_today)
+            return
 
         # ── Guard: skip LLM if there's nothing actionable ────────────────────────
         # Cheapest possible BUY = 5 shares × $0.05 = $0.25.  If we have no
@@ -147,6 +154,8 @@ class Trader:
             usdc_balance=balance,
             max_exposure_usd=max_exposure_usd,
             max_per_trade_usd=dynamic_max_per_trade,
+            trades_today=trades_today,
+            last_trade_ts=last_ts,
         )
 
         actionable = [d for d in result.decisions if d.action in ("BUY", "SELL")]
@@ -178,11 +187,12 @@ class Trader:
         max_per_trade_usd: float | None,
         max_open_positions: int | None,
     ) -> None:
-        # Enforce CLOB minimum: 5 shares × limit_price (dynamic, not a fixed dollar amount)
+        # Enforce minimums: 5 shares × price AND $3.00 floor (whichever is larger)
         if d.action == "BUY" and d.limit_price > 0:
-            min_cost = round(5.0 * d.limit_price, 2)
+            min_shares_cost = round(5.0 * d.limit_price, 2)
+            min_cost = max(3.0, min_shares_cost)
             if d.size_usdc < min_cost:
-                log.info("bumping size_usdc %.2f → %.2f (5 shares × %.3f)", d.size_usdc, min_cost, d.limit_price)
+                log.info("bumping size_usdc %.2f → %.2f (min $3 / 5-share floor)", d.size_usdc, min_cost)
                 d.size_usdc = min_cost
 
         reject = _risk_check(

@@ -40,7 +40,7 @@ DEFAULTS = {
     "max_exposure_pct": "30",   # percent of total (USDC + positions value)
     "max_per_trade_usd": "",    # empty = dynamic (10% bankroll)
     "stop_loss_usd": "",        # empty = disabled
-    "max_open_positions": "",   # empty = unlimited
+    "max_open_positions": "2",  # max 2 posiciones abiertas simultáneas
     "initial_bankroll": "",     # set on first /iniciar
 }
 
@@ -122,6 +122,46 @@ class Database:
 
     async def set_initial_bankroll(self, value: float) -> None:
         await self.set("initial_bankroll", str(value))
+
+    async def count_trades_today(self) -> int:
+        """Count executed (non-dry-run, status=OK) trades since midnight UTC today."""
+        import calendar
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        midnight_utc = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+        midnight_ts = calendar.timegm(midnight_utc.timetuple())
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                """
+                SELECT COUNT(*) FROM trades
+                WHERE ts >= ?
+                  AND dry_run = 0
+                  AND status = 'OK'
+                """,
+                (midnight_ts,),
+            )
+            row = await cur.fetchone()
+        return row[0] if row else 0
+
+    async def last_trade_ts(self) -> float | None:
+        """Timestamp of the most recent non-dry-run executed trade today, or None."""
+        import calendar
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        midnight_utc = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+        midnight_ts = calendar.timegm(midnight_utc.timetuple())
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                """
+                SELECT ts FROM trades
+                WHERE ts >= ?
+                  AND dry_run = 0
+                ORDER BY ts DESC LIMIT 1
+                """,
+                (midnight_ts,),
+            )
+            row = await cur.fetchone()
+        return row[0] if row else None
 
     async def consecutive_losses_in_category(self, category: str, n: int = 3) -> int:
         """Count consecutive recent losses for trades whose title contains `category`."""
