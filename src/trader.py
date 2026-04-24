@@ -73,6 +73,19 @@ class Trader:
 
     # --------------------------------------------------------------- internal
     async def _cycle(self) -> None:
+        # ── Ventana horaria UTC ───────────────────────────────────────────────
+        import datetime as _dt
+        now_utc = _dt.datetime.now(_dt.timezone.utc)
+        h = now_utc.hour
+        start = self.cfg.trading_hour_start_utc
+        end   = self.cfg.trading_hour_end_utc
+        if not (start <= h < end):
+            log.info(
+                "cycle: fuera de ventana horaria (%02d:00–%02d:00 UTC), hora actual %02d:%02d UTC — skip",
+                start, end, h, now_utc.minute,
+            )
+            return
+
         strategy = await self.db.get_strategy()
         if not strategy.strip():
             return

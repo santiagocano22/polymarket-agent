@@ -50,6 +50,9 @@ class Config:
     market_max_volume_24h: float
     market_max_days_to_resolution: int
 
+    trading_hour_start_utc: int   # hora UTC en que el bot empieza a operar
+    trading_hour_end_utc: int     # hora UTC en que el bot deja de operar
+
     dry_run: bool
 
     clob_host: str = "https://clob.polymarket.com"
@@ -94,5 +97,7 @@ def load_config() -> Config:
         market_min_volume_24h=float(_optional("MARKET_MIN_VOLUME_24H", "500")),
         market_max_volume_24h=float(_optional("MARKET_MAX_VOLUME_24H", "10000000")),
         market_max_days_to_resolution=int(_optional("MARKET_MAX_DAYS_TO_RESOLUTION", "2")),
+        trading_hour_start_utc=int(_optional("TRADING_HOUR_START_UTC", "14")),
+        trading_hour_end_utc=int(_optional("TRADING_HOUR_END_UTC", "22")),
         dry_run=_optional("DRY_RUN", "true").lower() in ("1", "true", "yes"),
     )
