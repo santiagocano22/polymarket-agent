@@ -146,9 +146,9 @@ class Trader:
             trades_today, len(markets),
         )
 
-        # ── Circuit breaker duro: máximo 4 trades ejecutados por día UTC ────────
-        if trades_today >= 4:
-            log.info("cycle: circuit breaker — trades_today=%d >= 4, skipping LLM", trades_today)
+        # ── Circuit breaker duro: máximo 6 trades ejecutados por día UTC ────────
+        if trades_today >= 6:
+            log.info("cycle: circuit breaker — trades_today=%d >= 6, skipping LLM", trades_today)
             return
 
         # ── Guard: skip LLM if there's nothing actionable ────────────────────────
