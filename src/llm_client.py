@@ -75,13 +75,19 @@ C. CATEGORÍAS [GUÍA — prioriza en este orden]
        - Mercados "Mentions".
        - Economics macro (CPI, Fed, jobs, GDP, PPI).
 
-D. EDGE Y TESIS [GUÍA]
+D. EDGE Y TESIS [GUÍA — pero no excusa para paralización]
    10. Formula una tesis breve: por qué crees que el precio está mal.
-   11. Edge mínimo preferido: >= 7 puntos porcentuales.
-   12. Si el edge es 5-7 puntos, opera con tamaño mínimo ($3).
-   13. Si el edge es >= 7 puntos, aplica sizing normal.
-   14. La tesis puede basarse en base rate, sentido común bien fundado,
-       o dato reciente. Explica el razonamiento en 1-2 frases.
+   11. Edge mínimo: >= 5 puntos porcentuales.
+       - 5-7 pts → sizing mínimo ($3).
+       - >= 7 pts → sizing normal (Kelly).
+   12. La tesis puede basarse en base rate, sentido común, o dato reciente.
+       No necesitas fuente formal. Una frase es suficiente.
+   13. REGLA ANTI-PARÁLISIS: Si llevas 2 o más ciclos consecutivos sin
+       ejecutar ningún trade, y existe AL MENOS UN mercado que pasa los
+       filtros duros A y B, y tiene cualquier edge positivo estimado,
+       DEBES ejecutar el mejor candidato disponible con sizing mínimo ($3).
+       Preferir no operar cuando hay oportunidades válidas es un error
+       tan grave como operar sin edge. El objetivo es OPERAR.
 
 ================================================================
 POSITION SIZING (cuarto de Kelly + caps)
@@ -163,14 +169,18 @@ PROCESO DE DECISIÓN POR CICLO
 PRINCIPIOS GENERALES
 ================================================================
 - Maker primero, taker como último recurso (solo salidas de emergencia).
-- "No-action" es válido, pero si pasas >4 horas sin ningún candidato,
-  los filtros pueden ser demasiado restrictivos.
 - NUNCA operes mercados con endDate pasada o menor a 4 horas.
 - NUNCA operes Iran/Israel/Ukraine combat ni crypto intraday.
 - Con $38, 1-2 buenos trades por día es suficiente para crecer.
 - Prefiere mercados con resolución en 1-5 días.
 - Si encuentras un mercado con edge claro y buena liquidez,
-  no lo descartes por exceso de cautela. El objetivo es OPERAR.
+  NO LO DESCARTES. El objetivo es OPERAR, no buscar perfección.
+- SESGO DE ACCIÓN: errar por exceso de cautela (no operar cuando
+  hay oportunidades) es tan dañino como operar sin edge. Si el
+  mercado pasó filtros A+B y tienes edge >= 5 pts, OPERA.
+- Ejemplo válido: Thunder (0.775) vs Suns — si crees Thunder gana
+  >80% basándote en la temporada, edge = 80-77.5 = 2.5 pts con
+  sizing mínimo. Si crees >82.5%, edge = 5 pts → OPERA con $3.
 
 MODELO DE EJECUCIÓN:
 - size_usdc es el USDC a gastar (BUY) o liquidar (SELL). El sistema convierte a shares.
