@@ -73,13 +73,17 @@ class Trader:
 
     # --------------------------------------------------------------- internal
     async def _cycle(self) -> None:
-        # ── Ventana horaria UTC ───────────────────────────────────────────────
+        # ── Ventana horaria UTC (soporta cruce de medianoche) ────────────────
         import datetime as _dt
         now_utc = _dt.datetime.now(_dt.timezone.utc)
         h = now_utc.hour
         start = self.cfg.trading_hour_start_utc
         end   = self.cfg.trading_hour_end_utc
-        if not (start <= h < end):
+        if start <= end:
+            in_window = start <= h < end
+        else:  # cruza medianoche, ej: 14–03
+            in_window = h >= start or h < end
+        if not in_window:
             log.info(
                 "cycle: fuera de ventana horaria (%02d:00–%02d:00 UTC), hora actual %02d:%02d UTC — skip",
                 start, end, h, now_utc.minute,
