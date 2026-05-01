@@ -76,8 +76,10 @@ class PolymarketClient:
         self._clob: ClobClient | None = None
         self._http = httpx.AsyncClient(timeout=20.0)
 
-    def _clob_client(self) -> ClobClient:
-        if self._clob is not None:
+    def _clob_client(self, fresh: bool = False) -> ClobClient:
+        """Return a ClobClient instance.
+        Use fresh=True for order placement to avoid nonce/version drift."""
+        if not fresh and self._clob is not None:
             return self._clob
         creds = ApiCreds(
             api_key=self.cfg.polymarket_api_key,
@@ -93,8 +95,10 @@ class PolymarketClient:
         )
         if self.cfg.polymarket_funder:
             kwargs["funder"] = self.cfg.polymarket_funder
-        self._clob = ClobClient(**kwargs)
-        return self._clob
+        client = ClobClient(**kwargs)
+        if not fresh:
+            self._clob = client
+        return client
 
     async def close(self) -> None:
         await self._http.aclose()
@@ -193,7 +197,7 @@ class PolymarketClient:
         Enforces minimum 5 shares; returns error dict if budget is insufficient."""
         def _call() -> dict[str, Any]:
             from decimal import Decimal, ROUND_DOWN
-            client = self._clob_client()
+            client = self._clob_client(fresh=True)  # fresh client evita nonce drift
             price_d = Decimal(str(max(0.001, min(0.999, round(float(limit_price), 4)))))
             usdc_d  = Decimal(str(usdc_amount))
 
@@ -217,7 +221,7 @@ class PolymarketClient:
     ) -> dict[str, Any]:
         """Place a maker SELL limit order. Enforces min 5 shares and valid price range."""
         def _call() -> dict[str, Any]:
-            client = self._clob_client()
+            client = self._clob_client(fresh=True)  # fresh client evita nonce drift
             price = max(0.001, min(0.999, round(float(limit_price), 4)))
             actual_shares = max(self.MIN_SHARES, round(float(shares), 2))
             args = OrderArgs(token_id=token_id, price=price, size=actual_shares, side="SELL")
