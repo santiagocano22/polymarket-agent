@@ -23,6 +23,17 @@ from .config import Config
 
 log = logging.getLogger(__name__)
 
+# Palabras clave prohibidas — descarte en Python antes de enviar al LLM
+_PROHIBITED_KEYWORDS = frozenset([
+    "iran", "israel", "hezbollah", "gaza", "ukraine", "ceasefire",
+    "airstrike", "peace deal", "how many times", "how often",
+    "mentions", "say the word", "tweet", "cpi", "fed rate",
+    "inflation rate", "jobs report", "gdp", "ppi report",
+])
+_PROHIBITED_EXACT = frozenset([
+    "mentions",
+])
+
 
 @dataclass
 class Market:
@@ -48,7 +59,7 @@ class Market:
         return {
             "id": self.id,
             "question": self.question,
-            "description": (self.description or "")[:400],
+            "description": (self.description or "")[:120],
             "end_date": self.end_date,
             "volume_24h": round(self.volume_24h, 2),
             "liquidity": round(self.liquidity, 2),
@@ -259,6 +270,50 @@ class PolymarketClient:
                 log.debug("midpoint error for %s: %s", token_id, e)
                 return None
         return await asyncio.to_thread(_call)
+
+
+def pre_filter_markets(markets: list[Market]) -> list[Market]:
+    """Apply hard rule-based filters in Python before sending to LLM.
+    Removes markets that fail deterministic checks, saving LLM input tokens."""
+    import re
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    result = []
+    for m in markets:
+        text = (m.question + " " + m.description).lower()
+
+        # Drop prohibited keyword markets
+        if any(kw in text for kw in _PROHIBITED_KEYWORDS):
+            log.debug("pre_filter: prohibited keyword — %s", m.question[:60])
+            continue
+
+        # Drop crypto intraday (15-min, hourly)
+        if re.search(r"\b(15.?min|hourly|per hour)\b", text):
+            log.debug("pre_filter: crypto intraday — %s", m.question[:60])
+            continue
+
+        # Drop markets with end_date < 4 hours away
+        if m.end_date:
+            try:
+                end = _dt.datetime.fromisoformat(m.end_date.replace("Z", "+00:00"))
+                hours_left = (end - now).total_seconds() / 3600
+                if hours_left < 4:
+                    log.debug("pre_filter: ends in %.1fh — %s", hours_left, m.question[:60])
+                    continue
+            except Exception:
+                pass
+
+        # Drop price out of 0.05–0.95 range
+        if m.outcome_prices:
+            main_price = m.outcome_prices[0]
+            if not (0.05 <= main_price <= 0.95):
+                log.debug("pre_filter: price %.3f out of range — %s", main_price, m.question[:60])
+                continue
+
+        result.append(m)
+
+    log.info("pre_filter: %d → %d markets", len(markets), len(result))
+    return result
 
 
 # ----------------------------------------------------------------- helpers

@@ -10,7 +10,7 @@ from typing import Awaitable, Callable
 from .config import Config
 from .db import Database
 from .llm_client import Decision, LLMClient, LLMResult
-from .polymarket_client import Market, PolymarketClient, Position
+from .polymarket_client import Market, PolymarketClient, Position, pre_filter_markets
 
 log = logging.getLogger(__name__)
 
@@ -73,19 +73,22 @@ class Trader:
 
     # --------------------------------------------------------------- internal
     async def _cycle(self) -> None:
-        # ── Ventana horaria UTC (soporta cruce de medianoche) ────────────────
+        # ── Ventana horaria UTC ───────────────────────────────────────────────
         import datetime as _dt
         now_utc = _dt.datetime.now(_dt.timezone.utc)
         h = now_utc.hour
-        start = self.cfg.trading_hour_start_utc
-        end   = self.cfg.trading_hour_end_utc
+
+        # Leer parámetros operativos desde DB (con fallback a config)
+        start, end = await self.db.get_trading_hours(
+            self.cfg.trading_hour_start_utc, self.cfg.trading_hour_end_utc
+        )
         if start <= end:
             in_window = start <= h < end
-        else:  # cruza medianoche, ej: 14–03
+        else:
             in_window = h >= start or h < end
         if not in_window:
             log.info(
-                "cycle: fuera de ventana horaria (%02d:00–%02d:00 UTC), hora actual %02d:%02d UTC — skip",
+                "cycle: fuera de ventana (%02d–%02d UTC), hora=%02d:%02d — skip",
                 start, end, h, now_utc.minute,
             )
             return
@@ -94,31 +97,39 @@ class Trader:
         if not strategy.strip():
             return
 
-        markets, positions, balance, trades_today, last_ts = await asyncio.gather(
+        # Parámetros de mercado desde DB con fallback a config
+        min_vol  = await self.db.get_market_min_volume(self.cfg.market_min_volume_24h)
+        max_vol  = await self.db.get_market_max_volume(self.cfg.market_max_volume_24h)
+        max_days = await self.db.get_market_max_days(self.cfg.market_max_days_to_resolution)
+        max_trades_day = await self.db.get_max_trades_day()
+        claude_model = await self.db.get_claude_model(self.cfg.claude_model)
+
+        markets_raw, positions, balance, trades_today, last_ts = await asyncio.gather(
             self.poly.search_markets(
-                limit=60,
-                min_volume_24h=self.cfg.market_min_volume_24h,
-                max_volume_24h=self.cfg.market_max_volume_24h,
-                max_days_to_resolution=self.cfg.market_max_days_to_resolution,
+                limit=80,
+                min_volume_24h=min_vol,
+                max_volume_24h=max_vol,
+                max_days_to_resolution=max_days,
             ),
             self.poly.get_positions(),
             self.poly.get_usdc_balance(),
             self.db.count_trades_today(),
             self.db.last_trade_ts(),
         )
-        markets = markets[: self.cfg.max_markets_per_cycle]
 
-        max_exposure_pct = await self.db.get_max_exposure_pct()
-        max_per_trade_usd = await self.db.get_max_per_trade_usd()
-        stop_loss_usd     = await self.db.get_stop_loss_usd()
+        # Pre-filtro en Python — descarta candidatos inelegibles antes del LLM
+        markets_filtered = pre_filter_markets(markets_raw)
+        markets = markets_filtered[: self.cfg.max_markets_per_cycle]
+
+        max_exposure_pct   = await self.db.get_max_exposure_pct()
+        max_per_trade_usd  = await self.db.get_max_per_trade_usd()
+        stop_loss_usd      = await self.db.get_stop_loss_usd()
         max_open_positions = await self.db.get_max_open_positions()
-        initial_bankroll  = await self.db.get_initial_bankroll()
+        initial_bankroll   = await self.db.get_initial_bankroll()
 
-        positions_value = sum(p.current_value_usdc for p in positions)
-        total_value     = balance + positions_value
+        positions_value  = sum(p.current_value_usdc for p in positions)
+        total_value      = balance + positions_value
         max_exposure_usd = total_value * (max_exposure_pct / 100.0)
-
-        # ── Sizing dinámico: 10% del bankroll actual si no hay cap explícito ──
         dynamic_max_per_trade = max_per_trade_usd or round(total_value * 0.10, 2)
 
         # ── Stop-loss absoluto ────────────────────────────────────────────────
@@ -142,26 +153,28 @@ class Trader:
             )
 
         log.info(
-            "cycle: balance=%.2f pos_value=%.2f total=%.2f "
-            "max_exposure=%.2f max_per_trade=%.2f open=%d/%s trades_today=%d markets=%d",
+            "cycle: bal=%.2f pos_val=%.2f total=%.2f max_exp=%.2f max_trade=%.2f "
+            "open=%d/%s trades_today=%d/%d markets_raw=%d markets_ok=%d model=%s",
             balance, positions_value, total_value, max_exposure_usd,
             dynamic_max_per_trade, len(positions),
             str(max_open_positions) if max_open_positions else "∞",
-            trades_today, len(markets),
+            trades_today, max_trades_day, len(markets_raw), len(markets), claude_model,
         )
 
-        # ── Circuit breaker duro: máximo 6 trades ejecutados por día UTC ────────
-        if trades_today >= 6:
-            log.info("cycle: circuit breaker — trades_today=%d >= 6, skipping LLM", trades_today)
+        # ── Circuit breaker duro ──────────────────────────────────────────────
+        if trades_today >= max_trades_day:
+            log.info("cycle: circuit breaker — trades_today=%d >= %d, skip LLM", trades_today, max_trades_day)
             return
 
-        # ── Guard: skip LLM if there's nothing actionable ────────────────────────
-        # Cheapest possible BUY = 5 shares × $0.05 = $0.25.  If we have no
-        # balance AND no open positions worth monitoring, the LLM call wastes
-        # money without producing any executable decisions.
+        # ── Guard: sin balance Y sin posiciones → no hay nada que hacer ──────
         MIN_BUY_BUDGET = 0.25
         if balance < MIN_BUY_BUDGET and not positions:
-            log.info("cycle: skipping LLM — balance $%.2f, no positions", balance)
+            log.info("cycle: skip LLM — balance $%.2f, sin posiciones", balance)
+            return
+
+        # ── Guard: sin candidatos Y sin posiciones abiertas → skip LLM ───────
+        if not markets and not positions:
+            log.info("cycle: skip LLM — 0 mercados elegibles y sin posiciones abiertas")
             return
 
         result = await self.llm.decide(
@@ -173,11 +186,19 @@ class Trader:
             max_per_trade_usd=dynamic_max_per_trade,
             trades_today=trades_today,
             last_trade_ts=last_ts,
+            model=claude_model,
+        )
+
+        # Acumular uso de tokens en DB para /costo
+        await self.db.accumulate_tokens(
+            result.tokens_in,
+            result.tokens_out,
+            result.tokens_cached_read,
         )
 
         actionable = [d for d in result.decisions if d.action in ("BUY", "SELL")]
         if not actionable:
-            log.info("LLM produced no actionable decisions — analysis: %s", result.analysis)
+            log.info("LLM: no actionable decisions — %s", result.analysis)
             return
 
         for d in actionable:

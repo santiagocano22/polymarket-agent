@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
+
+log = logging.getLogger(__name__)
 
 
 SCHEMA = """
@@ -42,6 +45,18 @@ DEFAULTS = {
     "stop_loss_usd": "",        # empty = disabled
     "max_open_positions": "2",  # max 2 posiciones abiertas simultáneas
     "initial_bankroll": "",     # set on first /iniciar
+    "loop_interval_seconds": "",   # vacío = usar config
+    "trading_hour_start": "",      # vacío = usar config
+    "trading_hour_end": "",        # vacío = usar config
+    "market_min_volume": "",       # vacío = usar config
+    "market_max_volume": "",       # vacío = usar config
+    "market_max_days": "",         # vacío = usar config
+    "max_trades_day": "6",
+    "claude_model": "",            # vacío = usar config
+    "daily_tokens_date": "",       # fecha YYYY-MM-DD del contador diario
+    "daily_tokens_in": "0",
+    "daily_tokens_out": "0",
+    "daily_tokens_cached": "0",
 }
 
 
@@ -222,6 +237,74 @@ class Database:
                 ),
             )
             await db.commit()
+
+    async def get_loop_interval(self, default: int) -> int:
+        raw = await self.get("loop_interval_seconds", "")
+        return int(raw) if raw else default
+
+    async def get_trading_hours(self, default_start: int, default_end: int) -> tuple[int, int]:
+        s = await self.get("trading_hour_start", "")
+        e = await self.get("trading_hour_end", "")
+        return (int(s) if s else default_start, int(e) if e else default_end)
+
+    async def get_market_min_volume(self, default: float) -> float:
+        raw = await self.get("market_min_volume", "")
+        return float(raw) if raw else default
+
+    async def get_market_max_volume(self, default: float) -> float:
+        raw = await self.get("market_max_volume", "")
+        return float(raw) if raw else default
+
+    async def get_market_max_days(self, default: int) -> int:
+        raw = await self.get("market_max_days", "")
+        return int(raw) if raw else default
+
+    async def get_max_trades_day(self) -> int:
+        raw = await self.get("max_trades_day", "6")
+        return int(raw) if raw else 6
+
+    async def get_claude_model(self, default: str) -> str:
+        raw = await self.get("claude_model", "")
+        return raw if raw else default
+
+    async def accumulate_tokens(self, tokens_in: int, tokens_out: int, tokens_cached: int) -> None:
+        """Accumulate daily token usage, resetting counter at UTC midnight."""
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        stored_date = await self.get("daily_tokens_date", "")
+        if stored_date != today:
+            # Reset for new day
+            await self.set("daily_tokens_date", today)
+            await self.set("daily_tokens_in", str(tokens_in))
+            await self.set("daily_tokens_out", str(tokens_out))
+            await self.set("daily_tokens_cached", str(tokens_cached))
+        else:
+            prev_in     = int(await self.get("daily_tokens_in", "0") or "0")
+            prev_out    = int(await self.get("daily_tokens_out", "0") or "0")
+            prev_cached = int(await self.get("daily_tokens_cached", "0") or "0")
+            await self.set("daily_tokens_in",     str(prev_in     + tokens_in))
+            await self.set("daily_tokens_out",    str(prev_out    + tokens_out))
+            await self.set("daily_tokens_cached", str(prev_cached + tokens_cached))
+
+    async def get_daily_tokens(self) -> dict:
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        stored_date = await self.get("daily_tokens_date", "")
+        if stored_date != today:
+            return {"date": today, "tokens_in": 0, "tokens_out": 0, "tokens_cached": 0}
+        return {
+            "date": today,
+            "tokens_in":     int(await self.get("daily_tokens_in", "0") or "0"),
+            "tokens_out":    int(await self.get("daily_tokens_out", "0") or "0"),
+            "tokens_cached": int(await self.get("daily_tokens_cached", "0") or "0"),
+        }
+
+    async def ensure_strategy_populated(self, default_strategy: str) -> None:
+        """If strategy is empty or very short, populate with default_strategy."""
+        current = await self.get_strategy()
+        if len(current.strip()) < 200:
+            await self.set_strategy(default_strategy)
+            log.info("DB: strategy initialized with default template (%d chars)", len(default_strategy))
 
     async def recent_trades(self, limit: int = 10) -> list[Trade]:
         async with aiosqlite.connect(self.path) as db:

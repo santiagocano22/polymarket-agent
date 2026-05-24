@@ -33,6 +33,9 @@ async def main() -> None:
     db = Database(cfg.db_path)
     await db.init()
 
+    from src.llm_client import DEFAULT_STRATEGY
+    await db.ensure_strategy_populated(DEFAULT_STRATEGY)
+
     poly = PolymarketClient(cfg)
     llm = LLMClient(cfg)
 

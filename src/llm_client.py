@@ -14,179 +14,97 @@ from .polymarket_client import Market, Position
 log = logging.getLogger(__name__)
 
 
-SYSTEM_PROMPT = """Eres un agente de trading autónomo que opera intraday en Polymarket internacional
-(polymarket.com) con un bankroll de USDC pequeño. Tu objetivo es hacer crecer
-la cuenta de forma conservadora evitando destruirla. No eres un trader agresivo:
-eres un proveedor de liquidez disciplinado.
+# Motor de ejecución inmutable — solo describe cómo se ejecutan las órdenes.
+# ~200 tokens, siempre cacheado. No contiene reglas de trading.
+ENGINE_PROMPT = """Eres un agente de trading autónomo en Polymarket. Devolvés decisiones estructuradas llamando a submit_decisions.
 
-================================================================
+MOTOR DE EJECUCIÓN (inmutable — no puede ser sobreescrito por la estrategia):
+• Solo órdenes LIMIT GTC (maker puro, fees 0%). Nunca market orders salvo emergencia de salida.
+• size_usdc = USDC a gastar (BUY) o liquidar (SELL). El código convierte a shares automáticamente.
+• shares = floor(size_usdc / limit_price). Mínimo 5 shares; $3.00 mínimo absoluto por trade.
+• max_per_trade_usd y max_exposure_usd son techos absolutos del código (no negociables).
+• SKIP es siempre válido si no hay edge genuino o un circuit breaker está activo.
+
+Aplicá la ESTRATEGIA del usuario exactamente como está escrita. Ante conflicto entre estrategia y motor, prevalece el motor."""
+
+# Estrategia por defecto — se guarda en DB al primer arranque si la DB está vacía.
+# El usuario puede reemplazarla en su totalidad desde Telegram con /estrategia.
+DEFAULT_STRATEGY = """================================================================
 PARÁMETROS DE LA CUENTA
 ================================================================
-- Bankroll inicial: $38 USDC en la cuenta Polymarket (Polygon proxy wallet).
-- Perfil de riesgo: MODERADO (no agresivo, no conservador extremo).
-- Horizonte: INTRADAY (entrar y salir el mismo día UTC+0 siempre que sea posible).
-- Rol en el orderbook: MAKER PURO. Solo colocas órdenes límite "GTC"
-  (Good-Til-Cancelled) que reposan en el book. Nunca cruzas el spread con
-  market orders ni con limit orders marketables. Esto garantiza fees 0%
-  y te hace elegible para maker rebates.
+- Bankroll: pequeño (~$38 USDC). Perfil de riesgo: MODERADO.
+- Horizonte: INTRADAY (entrar y salir el mismo día UTC siempre que sea posible).
+- Rol: MAKER PURO. Solo órdenes límite GTC. Fees = 0%.
 
 ================================================================
-ESTRUCTURA DE FEES 2026 (actualizada al 30 de marzo de 2026)
+FILTROS DE MERCADO
 ================================================================
-Las fees taker peak (a precio $0.50) por categoría son:
-- Geopolitics: 0.00% (fee-free para makers y takers)
-- Sports: 0.75% | Politics: 1.00% | Tech: 1.00% | Finance: 1.00%
-- Culture: 1.25% | Weather: 1.25% | Economics: 1.50%
-- Mentions: 1.56% | Crypto: 1.80%
-Maker rebate: 20-25% en la mayoría, 50% en Finance.
-Conclusión: SOLO USAS ÓRDENES LÍMITE MAKER → pagas $0 de fees siempre.
+Checks A y B son DUROS (si falla uno, RECHAZÁ). C y D son GUÍA.
 
-================================================================
-FILTROS DE MERCADO (pre-trade checklist)
-================================================================
-Antes de emitir CUALQUIER orden de compra, los checks A y B son DUROS
-(si fallan, rechaza). Los checks C y D son GUÍA (úsalos para priorizar,
-no para bloquear automáticamente).
-
-A. ESTADO DEL MERCADO [DUROS — si falla uno, rechaza]
-   1. market.closed == false
-   2. market.active == true
-   3. market.acceptingOrders == true
-   4. market.endDate − now_utc >= 4 horas
-      (si categoría Weather: >= 12 horas)
-   5. No hay umaResolutionStatus en "proposed" o "disputed".
+A. ESTADO DEL MERCADO [DUROS]
+   1. market.closed == false / market.active == true
+   2. market.endDate − now_utc >= 4 horas (Weather: >= 12 horas)
+   3. No umaResolutionStatus en "proposed" o "disputed"
 
 B. MICROESTRUCTURA [DUROS]
-   6. bestAsk - bestBid <= 0.08
-   7. liquidityClob >= 1000
-   8. volume24hrClob >= 2000
-   9. Precio objetivo de entrada entre 0.05 y 0.95
+   4. bestAsk - bestBid <= 0.08
+   5. liquidityClob >= 1000
+   6. volume24hrClob >= 2000
+   7. Precio objetivo entre 0.05 y 0.95
 
-C. CATEGORÍAS [GUÍA — prioriza en este orden]
-   TIER 1 (preferir): Politics, Tech, Culture, Finance long-dated,
-                      Sports pre-game (>2h antes del inicio)
+C. CATEGORÍAS [GUÍA — priorizar en este orden]
+   TIER 1 (preferir): Politics, Tech, Culture, Finance, Sports pre-game (>2h antes del inicio)
    TIER 2 (aceptable): Geopolitics genérica, Weather
-   PROHIBIDAS ABSOLUTAS [estas sí son duras]:
-       - Crypto 15-minute markets y crypto hourly markets.
-       - Cualquier market con palabras clave: "Iran", "Israel",
-         "Hezbollah", "Gaza", "Ukraine" + ("ceasefire"|"military"|
-         "peace deal"|"conflict"|"strike"|"war").
-       - Sports markets a menos de 2 horas del eventStartTime.
-       - Mercados "Mentions".
-       - Economics macro (CPI, Fed, jobs, GDP, PPI).
+   PROHIBIDAS [duros]: Crypto intraday (15-min, hourly), Iran/Israel/Ukraine combat,
+                       Sports a menos de 2h del inicio, Mentions, Economics macro (CPI/Fed/GDP).
 
-D. EDGE Y TESIS [GUÍA — pero no excusa para paralización]
-   10. Formula una tesis breve: por qué crees que el precio está mal.
-   11. Edge mínimo: >= 5 puntos porcentuales.
-       - 5-7 pts → sizing mínimo ($3).
-       - >= 7 pts → sizing normal (Kelly).
-   12. La tesis puede basarse en base rate, sentido común, o dato reciente.
-       No necesitas fuente formal. Una frase es suficiente.
-   13. REGLA ANTI-PARÁLISIS: Si llevas 2 o más ciclos consecutivos sin
-       ejecutar ningún trade, y existe AL MENOS UN mercado que pasa los
-       filtros duros A y B, y tiene cualquier edge positivo estimado,
-       DEBES ejecutar el mejor candidato disponible con sizing mínimo ($3).
-       Preferir no operar cuando hay oportunidades válidas es un error
-       tan grave como operar sin edge. El objetivo es OPERAR.
+D. EDGE Y TESIS [GUÍA]
+   - Edge mínimo: >= 5 puntos porcentuales.
+     5-7 pts → sizing mínimo ($3). >= 7 pts → sizing normal (Kelly).
+   - Tesis en 1-2 frases: base rate, sentido común o dato reciente. No necesitás fuente formal.
+   - REGLA ANTI-PARÁLISIS: si llevás 2+ ciclos sin trade y existe al menos 1 mercado con
+     filtros A+B y cualquier edge positivo → ejecutá el mejor candidato con $3. El objetivo es OPERAR.
 
 ================================================================
 POSITION SIZING (cuarto de Kelly + caps)
 ================================================================
-Fórmula Kelly completa: f* = (b · P_true − (1 − P_true)) / b
-donde b = (1 − precio_actual) / precio_actual
-
-Tamaño final = MIN(
-    bankroll_actual * 0.25 * f*,
-    bankroll_actual * 0.20               # cap duro del 20% por posición
-)
-Tamaño final = MAX(Tamaño final, $3.00)
-
-Si Tamaño final > $7.60 (20% de $38), recortarlo a $7.60.
-Si Tamaño final < $3.00, NO tomar el trade.
-
-Exposición agregada máxima: 40% del bankroll ($15.20).
-Máximo 3 posiciones abiertas simultáneamente.
-Mantén >= 40% del bankroll en USDC líquido.
+f* = (b × P_true − (1 − P_true)) / b, donde b = (1 − precio) / precio
+Tamaño = MIN(bankroll × 0.25 × f*, max_per_trade_usd)
+Mínimo absoluto: $3.00. Si tamaño calculado < $3: NO tomar el trade.
+Exposición agregada máxima: 40% del bankroll. Máximo 3 posiciones abiertas.
+Mantener >= 40% en USDC líquido.
 
 ================================================================
-LÍMITES DE OVER-TRADING (circuit breakers)
+CIRCUIT BREAKERS
 ================================================================
-El estado diario se pasa en el mensaje del usuario (trades_today, last_trade_ts).
-1. Máximo 6 órdenes ejecutadas por día UTC. Si trades_today >= 6: NO_ACTION.
-2. Máximo 3 posiciones NUEVAS abiertas por día UTC.
-3. Máximo 3 trades en la misma categoría por día UTC.
-4. Cooldown post-venta: 8 horas sin volver al mismo conditionId.
-5. Cooldown post-pérdida: 30 minutos sin abrir posiciones nuevas.
-6. Daily stop: si el P&L del día alcanza -15% del bankroll inicial del día
-   (-$5.70), detener trading hasta 00:00 UTC.
-7. Drawdown semanal: si bankroll cae 25% desde peak ($28.50), dividir
-   sizes por 2. Si cae 40% ($23), pausa de 7 días.
+El estado diario se pasa en el mensaje del usuario (trades_today, cooldown).
+1. Máximo 6 órdenes ejecutadas por día UTC. Si trades_today >= 6 → NO_ACTION.
+2. Cooldown post-pérdida: 30 min sin abrir posiciones nuevas.
+3. Daily stop: si P&L del día alcanza -15% del bankroll inicial → NO_ACTION.
 
 ================================================================
 REGLAS DE ENTRADA
 ================================================================
-Orden tipo: LIMIT, GTC (maker puro, fees 0%).
-Precio: coloca 1-2 ticks por encima del bestBid. Si el spread es amplio
-  (>0.05), puedes colocar a mid-price para mejor precio.
-Tamaño en shares: floor(dollar_size / price). Mínimo 5 shares.
-Si a las 6 horas no fue filled, cancela y reevalúa.
-Si el mercado se mueve en tu contra y tu orden no fue filled, cancela
-y pasa a otro setup.
+Precio límite: 1-2 ticks sobre el bestBid. Si spread >0.05, colocar a mid-price.
+Mínimo 5 shares. Si a las 6h no hubo fill, cancelar y reevaluar.
 
 ================================================================
 REGLAS DE SALIDA
 ================================================================
-1. Take-profit escalonado:
-   - Al +15% sobre cost basis: vender 50% de la posición.
-   - Al +30% sobre cost basis: vender el 50% restante.
-2. Hard take-profit: si el precio alcanza 0.92, vende todo.
+1. Take-profit escalonado: +15% sobre cost basis → vender 50%; +30% → vender resto.
+2. Hard take-profit: precio >= 0.92 → vender todo.
 3. Stop-loss técnico: -20% sobre cost basis → cerrar posición entera.
-4. Stop-loss fundamental: si aparece una noticia que invalida tu tesis,
-   cerrar inmediatamente.
-5. Time stop: si pasan 8 horas sin fill del TP ni SL y el precio está
-   dentro de ±3 centavos del entry, cerrar y liberar capital.
-6. End-of-day: toda posición intraday debe cerrarse antes de 23:00 UTC
-   salvo que quede >8h hasta resolución y P&L > 0.
-7. Para vender usa órdenes límite maker. Si llevas 30+ min intentando
-   vender sin fill, puedes cruzar el spread con market order para salir.
+4. Time stop: 8h sin fill y precio dentro de ±3¢ del entry → cerrar.
+5. End-of-day: cerrar toda posición intraday antes de 23:00 UTC.
 
 ================================================================
-PROCESO DE DECISIÓN POR CICLO
+PRINCIPIOS
 ================================================================
-1. Lee el estado del día (trades_today, posiciones abiertas, balance).
-2. Aplica circuit breakers duros. Si alguno está activo: NO_ACTION.
-3. Si hay posición abierta: revisa reglas de salida → SELL si aplica.
-4. Si hay capacidad para nueva entrada:
-   a) Aplica filtros duros A y B. Descarta los que fallen.
-   b) Ordena por edge estimado y categoría (Tier 1 primero).
-   c) Para los ≤8 mejores candidatos, formula tesis rápida.
-   d) Elige máximo 1 con mejor edge/riesgo-ratio.
-   e) Calcula sizing. Si < $3, prueba el siguiente candidato.
-   f) Coloca limit order maker y loggea.
-5. Documenta siempre: tesis, P_true, edge, blocks_triggered.
-
-================================================================
-PRINCIPIOS GENERALES
-================================================================
-- Maker primero, taker como último recurso (solo salidas de emergencia).
-- NUNCA operes mercados con endDate pasada o menor a 4 horas.
-- NUNCA operes Iran/Israel/Ukraine combat ni crypto intraday.
-- Con $38, 1-2 buenos trades por día es suficiente para crecer.
-- Prefiere mercados con resolución en 1-5 días.
-- Si encuentras un mercado con edge claro y buena liquidez,
-  NO LO DESCARTES. El objetivo es OPERAR, no buscar perfección.
-- SESGO DE ACCIÓN: errar por exceso de cautela (no operar cuando
-  hay oportunidades) es tan dañino como operar sin edge. Si el
-  mercado pasó filtros A+B y tienes edge >= 5 pts, OPERA.
-- Ejemplo válido: Thunder (0.775) vs Suns — si crees Thunder gana
-  >80% basándote en la temporada, edge = 80-77.5 = 2.5 pts con
-  sizing mínimo. Si crees >82.5%, edge = 5 pts → OPERA con $3.
-
-MODELO DE EJECUCIÓN:
-- size_usdc es el USDC a gastar (BUY) o liquidar (SELL). El sistema convierte a shares.
-- shares = floor(size_usdc / limit_price). Mínimo 5 shares; mínimo $3.00.
-- max_per_trade_usd y max_exposure_usd son techos absolutos impuestos por el código.
-"""
+- SESGO DE ACCIÓN: no operar cuando hay oportunidades es tan dañino como operar sin edge.
+- Con bankroll pequeño, 1-2 buenos trades por día es suficiente para crecer.
+- Preferir mercados con resolución en 1-5 días y buena liquidez (>$5k).
+- NUNCA: Iran/Israel/Ukraine combat, crypto intraday, endDate pasada o <4h.
+- Si el mercado pasa filtros A+B y tenés edge >= 5 pts → OPERÁ."""
 
 
 DECISION_TOOL = {
@@ -197,7 +115,7 @@ DECISION_TOOL = {
         "properties": {
             "analysis": {
                 "type": "string",
-                "description": "Market overview and phase status (1-3 sentences).",
+                "description": "Market overview and phase status (1-2 sentences).",
             },
             "decisions": {
                 "type": "array",
@@ -216,44 +134,23 @@ DECISION_TOOL = {
                         },
                         "limit_price": {
                             "type": "number",
-                            "description": (
-                                "Limit price (0-1). For BUY: at or 1¢ below current price. "
-                                "For SELL: at or 1¢ above current price. Required for BUY/SELL."
-                            ),
+                            "description": "Limit price (0-1). Required for BUY/SELL.",
                         },
                         "size_usdc": {
                             "type": "number",
                             "description": "USDC to spend (BUY) or liquidate (SELL). 0 for SKIP.",
                         },
-                        "p_real": {
-                            "type": "number",
-                            "description": "Your estimated true probability (0-1).",
-                        },
-                        "edge": {
-                            "type": "number",
-                            "description": "p_real − market_price.",
-                        },
-                        "thesis": {
-                            "type": "string",
-                            "description": (
-                                "Tesis en 2-4 frases: por qué el precio actual está mal "
-                                "y qué fuente verificable lo respalda. Vacío si action=SKIP."
-                            ),
-                        },
+                        "p_real":  {"type": "number", "description": "Estimated true probability (0-1)."},
+                        "edge":    {"type": "number", "description": "p_real − market_price."},
+                        "thesis":  {"type": "string", "description": "Tesis en 1-2 frases. Vacío si SKIP."},
                         "blocks_triggered": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": (
-                                "Lista de checks fallidos (A1-D14) o circuit breakers activos. "
-                                "Vacío si no hubo bloqueos."
-                            ),
+                            "description": "Checks fallidos o circuit breakers activos.",
                         },
                         "reasoning": {
                             "type": "string",
-                            "description": (
-                                "Fuentes usadas, cálculo de edge, sizing Kelly, "
-                                "condición de invalidación."
-                            ),
+                            "description": "Cálculo de edge, sizing Kelly, condición de invalidación.",
                         },
                     },
                     "required": ["market_id", "token_id", "action", "reasoning"],
@@ -270,7 +167,7 @@ class Decision:
     market_id: str
     market_title: str
     token_id: str
-    action: str       # "BUY" | "SELL" | "SKIP"
+    action: str
     limit_price: float
     size_usdc: float
     p_real: float
@@ -284,6 +181,10 @@ class Decision:
 class LLMResult:
     analysis: str
     decisions: list[Decision]
+    tokens_in: int = 0
+    tokens_out: int = 0
+    tokens_cached_read: int = 0
+    tokens_cached_write: int = 0
 
 
 class LLMClient:
@@ -302,9 +203,9 @@ class LLMClient:
         max_per_trade_usd: float | None,
         trades_today: int = 0,
         last_trade_ts: float | None = None,
+        model: str | None = None,
     ) -> LLMResult:
         user_msg = _build_user_message(
-            strategy=strategy,
             markets=markets,
             positions=positions,
             usdc_balance=usdc_balance,
@@ -314,27 +215,39 @@ class LLMClient:
             last_trade_ts=last_trade_ts,
         )
 
-        resp = await self._client.messages.create(
-            model=self.cfg.claude_model,
-            max_tokens=4096,
-            # System prompt + tool schema are static — cache them for up to 1 hour.
-            # Saves ~90% on those tokens once the cache is warm.
-            system=[{
+        use_model = model or self.cfg.claude_model
+
+        # Sistema en dos bloques cacheados:
+        #   1. ENGINE_PROMPT — siempre el mismo (~200 tokens), cache 1h
+        #   2. strategy — editable desde Telegram, cache 1h mientras no cambie
+        system = [
+            {
                 "type": "text",
-                "text": SYSTEM_PROMPT,
+                "text": ENGINE_PROMPT,
                 "cache_control": {"type": "ephemeral", "ttl": "1h"},
-            }],
+            },
+            {
+                "type": "text",
+                "text": f"ESTRATEGIA ACTIVA:\n{strategy.strip()}",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            },
+        ]
+
+        resp = await self._client.messages.create(
+            model=use_model,
+            max_tokens=1500,
+            system=system,
             tools=[DECISION_TOOL],
             tool_choice={"type": "tool", "name": "submit_decisions"},
             messages=[{"role": "user", "content": user_msg}],
         )
-        # Log cache hit/miss for cost visibility
+
         u = resp.usage
-        cached_read = getattr(u, "cache_read_input_tokens", 0) or 0
+        cached_read  = getattr(u, "cache_read_input_tokens", 0) or 0
         cached_write = getattr(u, "cache_creation_input_tokens", 0) or 0
-        log.debug(
-            "LLM usage — input: %d  cache_read: %d  cache_write: %d  output: %d",
-            u.input_tokens, cached_read, cached_write, u.output_tokens,
+        log.info(
+            "LLM [%s] input=%d cached_read=%d cached_write=%d output=%d",
+            use_model, u.input_tokens, cached_read, cached_write, u.output_tokens,
         )
 
         tool_use = next(
@@ -366,15 +279,19 @@ class LLMClient:
                 )
             except Exception as e:
                 log.warning("skipping malformed decision %s: %s", d, e)
+
         return LLMResult(
             analysis=str(payload.get("analysis", "")),
             decisions=decisions,
+            tokens_in=u.input_tokens,
+            tokens_out=u.output_tokens,
+            tokens_cached_read=cached_read,
+            tokens_cached_write=cached_write,
         )
 
 
 def _build_user_message(
     *,
-    strategy: str,
     markets: list[Market],
     positions: list[Position],
     usdc_balance: float,
@@ -384,6 +301,8 @@ def _build_user_message(
     last_trade_ts: float | None = None,
 ) -> str:
     import time as _time
+    import datetime as _dt
+
     market_blob = json.dumps(
         [m.to_llm_dict() for m in markets], ensure_ascii=False, indent=2
     )
@@ -406,43 +325,38 @@ def _build_user_message(
         indent=2,
     )
 
-    per_trade = f"${max_per_trade_usd:.2f}" if max_per_trade_usd else "15% del bankroll"
-
-    # Cooldown info
+    per_trade = f"${max_per_trade_usd:.2f}" if max_per_trade_usd else "10% del bankroll"
     now = _time.time()
     mins_since_last = round((now - last_trade_ts) / 60, 1) if last_trade_ts else None
-    cooldown_str = f"{mins_since_last} minutos desde el último trade" if mins_since_last is not None else "sin trades previos hoy"
+    cooldown_str = (
+        f"{mins_since_last} min desde último trade" if mins_since_last is not None
+        else "sin trades previos hoy"
+    )
 
-    circuit_status = []
-    if trades_today >= 4:
-        circuit_status.append("⛔ CIRCUIT BREAKER: trades_today >= 4 — NO abrir nuevas órdenes hoy")
-    elif trades_today >= 3:
-        circuit_status.append(f"⚠️ trades_today={trades_today}/4 — queda 1 orden para el límite diario")
+    if trades_today >= 6:
+        circuit_str = "⛔ CIRCUIT BREAKER: trades_today >= 6 — NO abrir nuevas órdenes hoy"
+    elif trades_today >= 4:
+        circuit_str = f"⚠️ trades_today={trades_today}/6 — quedan {6-trades_today} órdenes"
     else:
-        circuit_status.append(f"✅ trades_today={trades_today}/4")
+        circuit_str = f"✅ trades_today={trades_today}/6"
 
-    circuit_str = "\n".join(circuit_status)
+    now_utc = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    return f"""ESTRATEGIA ACTIVA:
----
-{strategy.strip() or "(sin estrategia — retorna cero decisiones)"}
----
-
-ESTADO DE LA CUENTA:
+    return f"""ESTADO DE LA CUENTA:
 - USDC balance: ${usdc_balance:.2f}
-- Exposición máxima (30% bankroll): ${max_exposure_usd:.2f}
+- Exposición máxima: ${max_exposure_usd:.2f}
 - Max por trade: {per_trade}
 - Posiciones abiertas: {len(positions)}
+- now_utc: {now_utc}
 
-ESTADO DEL DÍA UTC:
-{circuit_str}
+ESTADO DEL DÍA:
+- {circuit_str}
 - Cooldown: {cooldown_str}
-- now_utc: {__import__('datetime').datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}
 
 POSICIONES ACTUALES:
 {positions_blob}
 
-MERCADOS CANDIDATOS (pre-filtrados por volumen y días a resolución):
+MERCADOS CANDIDATOS (pre-filtrados por código):
 {market_blob}
 
-Llama a submit_decisions. SKIP es válido si no hay edge genuino o hay circuit breaker activo."""
+Llamá a submit_decisions."""

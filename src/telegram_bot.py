@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 
 HELP = (
     "<b>Comandos disponibles</b>\n"
-    "/estrategia &lt;texto&gt; — define/reemplaza la estrategia\n"
+    "/estrategia &lt;texto&gt; — define/reemplaza la estrategia completa\n"
     "/ver_estrategia — muestra la estrategia actual\n"
     "/iniciar — arranca el loop autónomo\n"
     "/pausar — pausa el loop\n"
@@ -34,11 +34,20 @@ HELP = (
     "/balance — USDC disponible\n"
     "/posiciones — posiciones abiertas\n"
     "/historial — últimos trades\n"
+    "/costo — tokens y costo estimado del día\n"
     "/vender_todo — liquida todas las posiciones\n"
     "/cancelarordenes — cancela todas las órdenes límite abiertas\n"
     "/limites &lt;pct&gt; [max_usd] — ajusta límites de riesgo\n"
     "/ver_limites — muestra límites actuales\n"
     "/dryrun &lt;on|off&gt; — alterna modo simulación\n"
+    "\n<b>Parámetros operativos (en caliente):</b>\n"
+    "/intervalo &lt;seg&gt; — intervalo del loop (ej: 600)\n"
+    "/ventana &lt;h_ini&gt; &lt;h_fin&gt; — horario UTC (ej: 14 22)\n"
+    "/volumen_min &lt;usd&gt; — volumen 24h mínimo de mercados\n"
+    "/volumen_max &lt;usd&gt; — volumen 24h máximo\n"
+    "/dias_max &lt;n&gt; — días máximos a resolución\n"
+    "/max_trades_dia &lt;n&gt; — circuit breaker diario\n"
+    "/modelo &lt;haiku|sonnet&gt; — modelo LLM activo\n"
     "/help — esta ayuda"
 )
 
@@ -309,6 +318,139 @@ def build_application(
     async def cmd_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Comando no reconocido. /help")
 
+    async def cmd_costo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        try:
+            data = await db.get_daily_tokens()
+            # Precios aproximados Sonnet 4.6 (USD por token)
+            model = await db.get_claude_model(cfg.claude_model)
+            if "haiku" in model.lower():
+                price_in, price_cached, price_out = 1.0, 0.10, 5.0
+            else:  # sonnet
+                price_in, price_cached, price_out = 3.0, 0.30, 15.0
+            ti, to, tc = data["tokens_in"], data["tokens_out"], data["tokens_cached"]
+            uncached_in = max(0, ti - tc)
+            cost = (uncached_in * price_in + tc * price_cached + to * price_out) / 1_000_000
+            await update.message.reply_text(
+                f"📊 <b>Tokens hoy ({data['date']})</b>\n"
+                f"Input: {ti:,} ({tc:,} cached)\n"
+                f"Output: {to:,}\n"
+                f"Modelo: {model}\n"
+                f"💰 Costo estimado: <b>${cost:.4f}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            await update.message.reply_text(f"Error: {e}")
+
+    async def cmd_intervalo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        parts = (update.message.text or "").split()
+        if len(parts) < 2:
+            current = await db.get_loop_interval(cfg.loop_interval_seconds)
+            await update.message.reply_text(f"Intervalo actual: {current}s\nUso: /intervalo <segundos>")
+            return
+        try:
+            val = int(parts[1])
+            if val < 60:
+                await update.message.reply_text("Mínimo 60 segundos.")
+                return
+        except ValueError:
+            await update.message.reply_text("Valor inválido.")
+            return
+        await db.set("loop_interval_seconds", str(val))
+        await update.message.reply_text(f"✅ Intervalo del loop: {val}s")
+
+    async def cmd_ventana(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        parts = (update.message.text or "").split()
+        if len(parts) < 3:
+            s, e = await db.get_trading_hours(cfg.trading_hour_start_utc, cfg.trading_hour_end_utc)
+            await update.message.reply_text(f"Ventana actual: {s:02d}:00–{e:02d}:00 UTC\nUso: /ventana <h_ini> <h_fin>")
+            return
+        try:
+            s, e = int(parts[1]), int(parts[2])
+            if not (0 <= s <= 23 and 0 <= e <= 23):
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Horas inválidas (0–23).")
+            return
+        await db.set("trading_hour_start", str(s))
+        await db.set("trading_hour_end", str(e))
+        await update.message.reply_text(f"✅ Ventana: {s:02d}:00–{e:02d}:00 UTC")
+
+    async def cmd_volumen_min(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        parts = (update.message.text or "").split()
+        if len(parts) < 2:
+            v = await db.get_market_min_volume(cfg.market_min_volume_24h)
+            await update.message.reply_text(f"Volumen mínimo 24h actual: ${v:,.0f}\nUso: /volumen_min <usd>")
+            return
+        try:
+            val = float(parts[1])
+        except ValueError:
+            await update.message.reply_text("Valor inválido.")
+            return
+        await db.set("market_min_volume", str(val))
+        await update.message.reply_text(f"✅ Volumen mínimo 24h: ${val:,.0f}")
+
+    async def cmd_volumen_max(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        parts = (update.message.text or "").split()
+        if len(parts) < 2:
+            v = await db.get_market_max_volume(cfg.market_max_volume_24h)
+            await update.message.reply_text(f"Volumen máximo 24h actual: ${v:,.0f}\nUso: /volumen_max <usd>")
+            return
+        try:
+            val = float(parts[1])
+        except ValueError:
+            await update.message.reply_text("Valor inválido.")
+            return
+        await db.set("market_max_volume", str(val))
+        await update.message.reply_text(f"✅ Volumen máximo 24h: ${val:,.0f}")
+
+    async def cmd_dias_max(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        parts = (update.message.text or "").split()
+        if len(parts) < 2:
+            v = await db.get_market_max_days(cfg.market_max_days_to_resolution)
+            await update.message.reply_text(f"Días máximos a resolución actual: {v}\nUso: /dias_max <n>")
+            return
+        try:
+            val = int(parts[1])
+        except ValueError:
+            await update.message.reply_text("Valor inválido.")
+            return
+        await db.set("market_max_days", str(val))
+        await update.message.reply_text(f"✅ Días máximos a resolución: {val}")
+
+    async def cmd_max_trades_dia(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        parts = (update.message.text or "").split()
+        if len(parts) < 2:
+            v = await db.get_max_trades_day()
+            await update.message.reply_text(f"Max trades por día actual: {v}\nUso: /max_trades_dia <n>")
+            return
+        try:
+            val = int(parts[1])
+        except ValueError:
+            await update.message.reply_text("Valor inválido.")
+            return
+        await db.set("max_trades_day", str(val))
+        await update.message.reply_text(f"✅ Circuit breaker diario: {val} trades máx")
+
+    async def cmd_modelo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        parts = (update.message.text or "").split()
+        if len(parts) < 2:
+            current = await db.get_claude_model(cfg.claude_model)
+            await update.message.reply_text(
+                f"Modelo actual: {current}\n"
+                f"Uso: /modelo <haiku|sonnet>\n"
+                f"Opciones: claude-haiku-4-5, claude-sonnet-4-6"
+            )
+            return
+        arg = parts[1].lower()
+        if "haiku" in arg:
+            model = "claude-haiku-4-5"
+        elif "sonnet" in arg:
+            model = "claude-sonnet-4-6"
+        else:
+            model = arg  # allow full model name
+        await db.set("claude_model", model)
+        await update.message.reply_text(f"✅ Modelo cambiado a: {model}")
+
     # ------------------------------------------------------------ register
     app.add_handler(CommandHandler("start", guarded(cmd_start)))
     app.add_handler(CommandHandler("help", guarded(cmd_help)))
@@ -327,6 +469,14 @@ def build_application(
     app.add_handler(CommandHandler("stoplossoff", guarded(cmd_stoplossoff)))
     app.add_handler(CommandHandler("maxposiciones", guarded(cmd_maxposiciones)))
     app.add_handler(CommandHandler("cancelarordenes", guarded(cmd_cancelarordenes)))
+    app.add_handler(CommandHandler("costo", guarded(cmd_costo)))
+    app.add_handler(CommandHandler("intervalo", guarded(cmd_intervalo)))
+    app.add_handler(CommandHandler("ventana", guarded(cmd_ventana)))
+    app.add_handler(CommandHandler("volumen_min", guarded(cmd_volumen_min)))
+    app.add_handler(CommandHandler("volumen_max", guarded(cmd_volumen_max)))
+    app.add_handler(CommandHandler("dias_max", guarded(cmd_dias_max)))
+    app.add_handler(CommandHandler("max_trades_dia", guarded(cmd_max_trades_dia)))
+    app.add_handler(CommandHandler("modelo", guarded(cmd_modelo)))
     app.add_handler(CommandHandler("dryrun", guarded(cmd_dryrun)))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, guarded(handle_text)))
     app.add_handler(MessageHandler(filters.COMMAND, guarded(cmd_unknown)))
