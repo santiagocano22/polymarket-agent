@@ -183,19 +183,27 @@ class PolymarketClient:
         out: list[Position] = []
         for p in data:
             try:
+                current_value = float(p.get("currentValue", 0))
+                size = float(p.get("size", 0))
+                # Skip positions that resolved worthless — value is $0 and
+                # they no longer appear in the user's active Polymarket account.
+                if current_value == 0.0:
+                    log.debug("skipping resolved/worthless position: %s", p.get("title", "")[:60])
+                    continue
                 out.append(
                     Position(
                         market_id=str(p.get("conditionId", "")),
                         token_id=str(p.get("asset", "")),
                         outcome=str(p.get("outcome", "")),
-                        size=float(p.get("size", 0)),
+                        size=size,
                         avg_price=float(p.get("avgPrice", 0)),
-                        current_value_usdc=float(p.get("currentValue", 0)),
+                        current_value_usdc=current_value,
                         title=str(p.get("title", "")),
                     )
                 )
             except Exception as e:
                 log.debug("skipping malformed position %s: %s", p, e)
+        log.debug("positions: %d active (filtered from %d raw)", len(out), len(data))
         return out
 
     # ----------------------------------------------------------------- orders
